@@ -30,7 +30,7 @@ def test_vector(file_path, spec):
         print(f"FAIL: {os.path.basename(file_path)} - Missing required keys")
         return False
     
-    # Run accumulate
+    # Run accumulate with corrected argument order
     try:
         output, post_state = accumulate(pre_state, input_data)
     except Exception as e:
