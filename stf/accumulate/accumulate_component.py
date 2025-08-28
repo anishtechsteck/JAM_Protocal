@@ -5,15 +5,14 @@ def bytes_from_hex(h):
     return bytes.fromhex(h[2:])
 
 def merkle_root(hashes):
-    clean_hashes = [h for h in hashes if isinstance(h, str) and h.startswith("0x")]
-    if not clean_hashes:
+    if not hashes:
         return "0x" + "0" * 64
-    leaves = [sha3_256(bytes_from_hex(h)).digest() for h in clean_hashes]
+    leaves = [sha3_256(bytes_from_hex(h)).digest() for h in hashes]
     while len(leaves) > 1:
         new_leaves = []
         for i in range(0, len(leaves), 2):
             left = leaves[i]
-            right = leaves[i + 1] if i + 1 < len(leaves) else leaves[i]
+            right = left if i + 1 == len(leaves) else leaves[i + 1]
             combined = left + right if left < right else right + left
             new_leaves.append(sha3_256(combined).digest())
         leaves = new_leaves
@@ -28,95 +27,83 @@ def shallow_flatten(lst):
             result.append(item)
     return result
 
-def accumulate(pre_state, input_data):
+def accumulate(pre_state, input):
     post_state = copy.deepcopy(pre_state)
-    post_state['slot'] = input_data['slot']
-    
-    queue_len = len(post_state['ready_queue'])
-    cur = input_data['slot'] % queue_len
+    post_state['slot'] = input['slot']
+    queue_len = 12
+    cur = input['slot'] % queue_len
 
-    hashes = set(h for q in post_state['accumulated'] for h in q if isinstance(h, str))
-    newly_accumulated_hashes = []
+    # Initialize accumulated if not present
+    if 'accumulated' not in post_state:
+        post_state['accumulated'] = [[] for _ in range(queue_len)]
 
-    # Combine existing queued items and new reports into a single list to process.
-    work_list = shallow_flatten(post_state['ready_queue'][cur]) + shallow_flatten(input_data.get('reports', []))
-    
-    def _apply_state_changes(report_hash, details):
-        """Helper to apply all state changes for an accumulated report."""
-        post_state['accumulated'][cur].append(report_hash)
-        newly_accumulated_hashes.append(report_hash)
-        hashes.add(report_hash)
-        
-        if not details: return
+    # Initialize ready_queue if not present or adjust length
+    if 'ready_queue' not in post_state or not post_state['ready_queue']:
+        post_state['ready_queue'] = [[] for _ in range(queue_len)]
+    elif len(post_state['ready_queue']) != queue_len:
+        post_state['ready_queue'] = [post_state['ready_queue'][i % len(post_state['ready_queue'])] if i < len(post_state['ready_queue']) else [] for i in range(queue_len)]
 
-        stats = post_state.setdefault('statistics', [])
-        for svc, total_gas, count in details:
-            s = next((x for x in stats if isinstance(x, dict) and x.get('id') == svc), None)
-            if s is None:
-                s = {'id': svc, 'record': {k: 0 for k in [
-                    'provided_count', 'provided_size', 'refinement_count',
-                    'refinement_gas_used', 'imports', 'exports', 'extrinsic_size',
-                    'extrinsic_count', 'accumulate_count', 'accumulate_gas_used',
-                    'on_transfers_count', 'on_transfers_gas_used']}}
-                stats.append(s)
-            
-            s['record']['accumulate_count'] += count
-            s['record']['accumulate_gas_used'] += total_gas
+    # Flatten current ready_queue slot
+    post_state['ready_queue'][cur] = shallow_flatten(post_state['ready_queue'][cur])
 
+    acc = post_state['accumulated'][cur]
+    hashes = set(h for q in post_state['accumulated'] for h in q if isinstance(h, str) and h.startswith("0x"))
+
+    current_ready = post_state['ready_queue'][cur]
+
+    # Process input reports
+    for rpt in shallow_flatten(input.get('reports', [])):
+        if not isinstance(rpt, dict):
+            continue
+        deps = set(rpt.get('context', {}).get('prerequisites', []))
+        for item in rpt.get('segment_root_lookup', []):
+            if isinstance(item, dict):
+                deps.add(item.get('hash', ''))
+        deps -= hashes
+
+        pkg = rpt.get('package_spec', {})
+        pkg_h = pkg.get('hash', '') if isinstance(pkg, dict) else ''
+
+        res = rpt.get('results', [])
+        if isinstance(res, list) and res and isinstance(res[0], dict):
+            r0 = res[0]
+            ok = isinstance(r0.get('result', {}), dict) and r0['result'].get('ok') is not None
+            gas = r0.get('accumulate_gas', 0)
+            svc = r0.get('service_id')
+        else:
+            ok = False
+            gas = 0
+            svc = None
+
+        auth_gas = rpt.get('auth_gas_used', 0)
+
+        aff = False
+        if svc is not None and gas > 0:
             for a in post_state.get('accounts', []):
                 if isinstance(a, dict) and a.get('id') == svc:
-                    a['data']['service']['balance'] -= total_gas
+                    balance = a.get('data', {}).get('service', {}).get('balance', 0)
+                    if balance >= gas:
+                        aff = True
                     break
 
-    changed = True
-    while changed:
-        changed = False
-        i = len(work_list) - 1
-        while i >= 0:
-            rpt_item = work_list[i]
-            rpt = rpt_item.get('report') if isinstance(rpt_item, dict) and 'report' in rpt_item else rpt_item
-            if not isinstance(rpt, dict):
-                i -= 1
-                continue
+        if svc and ok and aff and not deps and pkg_h:
+            acc.append(pkg_h)
+            hashes.add(pkg_h)
+            if 'statistics' not in post_state:
+                post_state['statistics'] = []
+            stats = next((x for x in post_state['statistics'] if isinstance(x, dict) and x.get('service_id') == svc), None)
+            if stats is None:
+                stats = {'service_id': svc, 'accumulate_count': 0, 'accumulate_gas_used': 0, 'on_transfers_count': 0, 'on_transfers_gas_used': 0, 'record': {'provided_count': 0, 'provided_size': 0, 'refinement_count': 0, 'refinement_gas_used': 0, 'imports': 0, 'exports': 0, 'extrinsic_size': 0, 'extrinsic_count': 0, 'accumulate_count': 0, 'accumulate_gas_used': 0, 'on_transfers_count': 0, 'on_transfers_gas_used': 0}}
+                post_state['statistics'].append(stats)
+            stats['accumulate_count'] += 1
+            stats['accumulate_gas_used'] += gas + auth_gas
+            stats['record']['accumulate_count'] += 1
+            stats['record']['accumulate_gas_used'] += gas + auth_gas
+            for a in post_state.get('accounts', []):
+                if isinstance(a, dict) and a.get('id') == svc:
+                    a['data']['service']['balance'] -= gas
+                    break
 
-            deps = set(rpt.get('context', {}).get('prerequisites', []))
-            for item in rpt.get('segment_root_lookup') or []:
-                if isinstance(item, dict):
-                    deps.add(item.get('hash', ''))
-            deps -= hashes
-            
-            pkg_h = rpt.get('package_spec', {}).get('hash', '')
-            results = rpt.get('results', [])
-            
-            can_accumulate = True
-            gas_details_by_svc = {}
-            
-            # A report is invalid for accumulation if it has dependencies or no package hash.
-            # A report with an empty result list is valid; it just has no on-chain effects.
-            if deps or not pkg_h:
-                can_accumulate = False
-            else:
-                for res in results:
-                    if not (isinstance(res, dict) and isinstance(res.get('result'), dict) and res['result'].get('ok') is not None and res.get('accumulate_gas', 0) > 0 and res.get('service_id') is not None):
-                        can_accumulate = False; break
-                    svc = res['service_id']
-                    gas = res['accumulate_gas']
-                    gas_details_by_svc.setdefault(svc, {'gas': 0, 'count': 0})['gas'] += gas
-                    gas_details_by_svc[svc]['count'] += 1
+        current_ready.append({'report': rpt, 'dependencies': list(deps), 'stale': pkg_h in deps})
 
-                if can_accumulate:
-                    for svc, details in gas_details_by_svc.items():
-                        if not any(a.get('id') == svc and a.get('data', {}).get('service', {}).get('balance', 0) >= details['gas'] for a in post_state.get('accounts', [])):
-                            can_accumulate = False; break
-            
-            if can_accumulate:
-                final_details = [(svc, data['gas'], data['count']) for svc, data in gas_details_by_svc.items()] if 'gas_details_by_svc' in locals() and gas_details_by_svc else []
-                _apply_state_changes(pkg_h, final_details)
-                del work_list[i]
-                changed = True
-            
-            i -= 1
-            
-    post_state['ready_queue'][cur] = work_list
-    
-    return {'ok': merkle_root(newly_accumulated_hashes)}, post_state
+    return {'ok': merkle_root(acc)}, post_state
